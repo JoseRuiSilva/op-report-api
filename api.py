@@ -4,45 +4,92 @@ from pydantic import BaseModel
 from datetime import datetime
 import psycopg2
 import psycopg2.extras
+import os
 
-# ── RAG imports ──────────────────────────────────────────
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_community.llms.ollama import Ollama
-from langchain_community.vectorstores import Chroma
-from langchain_community.embeddings.ollama import OllamaEmbeddings
+# ── SQL Agent imports ─────────────────────────────────────
+from langchain_community.utilities import SQLDatabase
+from langchain_community.agent_toolkits import create_sql_agent
+from langchain_groq import ChatGroq
 
 # ── Configurações ─────────────────────────────────────────
-DATABASE_URL = "postgresql://neondb_owner:npg_w1a5UZthFdEl@ep-bitter-star-agw2p5s2-pooler.c-2.eu-central-1.aws.neon.tech/neondb?sslmode=require&channel_binding=require"
-
-CHROMA_PATH = r"C:\Users\Alexandr\Desktop\Universidade\3º Ano\Projeto\Testes ChatBot\chatbot_rag\chroma"
-
-PROMPT_TEMPLATE = """
-Answer the question based only on the following context:
-
-{context}
-
----
-
-Answer the question based on the above context: {question}
-"""
+DATABASE_URL = os.environ["DATABASE_URL"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"]
 
 # ── Ligação Neon ─────────────────────────────────────────
 def get_db_connection():
     return psycopg2.connect(DATABASE_URL)
+
+# ── SQL Agent (inicializado uma vez no arranque) ──────────
+SYSTEM_PROMPT = """
+És um assistente perito em Ciência de Dados e PostgreSQL.
+A base de dados funciona num Modelo Dimensional (Star Schema).
+A tabela central é a `fact_values` (colunas: report_id, location_code, indicator_code, date_id, value, value_type).
+Para obteres nomes legíveis, tens OBRIGATORIAMENTE de fazer JOIN com as tabelas de dimensão:
+- JOIN dim_location l ON fact_values.location_code = l.location_code (para obteres l.location_name)
+- JOIN dim_indicator i ON fact_values.indicator_code = i.indicator_code (para obteres i.indicator_name)
+- JOIN dim_date d ON fact_values.date_id = d.date_id (para obteres d.year)
+
+PASSO 1: PADRÃO OBRIGATÓRIO PARA RANKINGS E POSIÇÕES
+Se o utilizador pedir uma posição, ranking, "melhor lugar", etc., É PROIBIDO filtrar pelo país na query principal.
+Tens OBRIGATORIAMENTE de usar este modelo exato (com subquery, PARTITION BY year e JOINs):
+
+SELECT year, ranking, value FROM (
+    SELECT
+        l.location_name as country,
+        d.year,
+        f.value,
+        RANK() OVER (PARTITION BY d.year ORDER BY f.value DESC) as ranking
+    FROM fact_values f
+    JOIN dim_location l ON f.location_code = l.location_code
+    JOIN dim_date d ON f.date_id = d.date_id
+    WHERE f.indicator_code = 'AQUI_A_SIGLA_DO_INDICADOR_EX_BCA'
+) subquery
+WHERE country = 'AQUI_O_NOME_DO_PAIS'
+ORDER BY ranking ASC LIMIT 1;
+
+PASSO 2: EXECUÇÃO OBRIGATÓRIA
+NÃO te limites a escrever o SQL corrigido no texto.
+Tens OBRIGATORIAMENTE de usar a ferramenta `sql_db_query` para executar o código e obter os números finais reais.
+
+PASSO 3: FORMATO DA RESPOSTA
+1. Responde à pergunta com os números reais devolvidos.
+2. Inclui a query SQL executada num bloco markdown (```sql ... ```).
+"""
+
+def build_agent():
+    db = SQLDatabase.from_uri(DATABASE_URL)
+    llm = ChatGroq(
+        model="llama-3.3-70b-versatile",
+        temperature=0,
+        groq_api_key=GROQ_API_KEY
+    )
+    agent = create_sql_agent(
+        llm=llm,
+        db=db,
+        agent_type="tool-calling",
+        verbose=False,
+        prefix=SYSTEM_PROMPT,
+        return_intermediate_steps=False
+    )
+    return agent
+
+# Inicializa o agente uma vez (lazy, na primeira chamada)
+_agent = None
+
+def get_agent():
+    global _agent
+    if _agent is None:
+        _agent = build_agent()
+    return _agent
 
 # ── App ──────────────────────────────────────────────────
 app = FastAPI(title="OP Report API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://joseruisilva.github.io",
-        "http://localhost:8000",
-        "http://127.0.0.1:5500",
-    ],
-    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_origins=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
-    allow_credentials=True,
 )
 
 # ── Schemas ───────────────────────────────────────────────
@@ -61,32 +108,6 @@ class OpDataIn(BaseModel):
     file_url: str
     extract_function: str
     file_type: str
-
-# ── Helpers RAG ───────────────────────────────────────────
-def get_embedding_function():
-    return OllamaEmbeddings(model="mxbai-embed-large")
-
-def query_rag(query_text: str):
-    embedding_function = get_embedding_function()
-
-    db = Chroma(
-        persist_directory=CHROMA_PATH,
-        embedding_function=embedding_function,
-    )
-
-    results = db.similarity_search_with_score(query_text, k=5)
-
-    context_text = "\n\n---\n\n".join([doc.page_content for doc, _score in results])
-    prompt_template = ChatPromptTemplate.from_template(PROMPT_TEMPLATE)
-    prompt = prompt_template.format(context=context_text, question=query_text)
-
-    model = Ollama(model="mistral")
-    response_text = model.invoke(prompt)
-
-    sources = [doc.metadata.get("id", None) for doc, _score in results]
-
-    return {"answer": response_text, "sources": sources}
-
 
 # ── Endpoints INSERÇÃO (POST) ─────────────────────────────
 
@@ -115,7 +136,7 @@ def add_op_data(data: OpDataIn):
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        
+
         cur.execute("SELECT 1 FROM op_report WHERE report_id = %s", (data.report_id,))
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail=f"Erro: O report_id {data.report_id} não existe na base de dados.")
@@ -125,7 +146,7 @@ def add_op_data(data: OpDataIn):
             VALUES (%s, %s, %s, %s, %s)
             RETURNING file_id;
         """, (data.report_id, data.file_name, data.file_url, data.extract_function, data.file_type))
-        
+
         file_id = cur.fetchone()[0]
         conn.commit()
         cur.close()
@@ -202,8 +223,8 @@ def get_fact_values(indicator_code: str):
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         query = """
-            SELECT 
-                c.location_code AS location_code, 
+            SELECT
+                c.location_code AS location_code,
                 c.location_name AS location_name,
                 d.year AS year,
                 f.value AS value
@@ -226,10 +247,13 @@ def get_fact_values(indicator_code: str):
 
 @app.post("/chat")
 def chat(body: ChatIn):
+    """Responde a perguntas em linguagem natural usando um SQL Agent com Groq + LLaMA."""
     if not body.question.strip():
         raise HTTPException(status_code=400, detail="A pergunta não pode estar vazia.")
     try:
-        result = query_rag(body.question)
-        return result
+        agent = get_agent()
+        result = agent.invoke({"input": body.question})
+        answer = result.get("output", str(result))
+        return {"answer": answer, "sources": []}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

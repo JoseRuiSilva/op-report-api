@@ -1,6 +1,8 @@
 fastapi
 uvicorn
 psycopg2-binary
-langchain-core
+pydantic
+langchain
 langchain-community
-ollama
+langchain-groq
+sqlalchemy
